@@ -153,10 +153,6 @@ rx_streamer::sptr b100_impl::get_rx_stream(const uhd::stream_args_t &args_){
     id.num_outputs = 1;
     my_streamer->set_converter(id);
 
-    //flush stuff
-    _data_transport->get_recv_buff(-1.0); //negative flushes!!
-    _recv_demuxer->flush();
-
     //bind callbacks for the handler
     for (size_t chan_i = 0; chan_i < args.channels.size(); chan_i++){
         const size_t dsp = args.channels[chan_i];
