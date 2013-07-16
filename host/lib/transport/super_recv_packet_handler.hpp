@@ -79,22 +79,22 @@ public:
     }
 
     ~recv_packet_handler(void){
-        _task_barrier.interrupt();
-        _task_handlers.clear();
+        //_task_barrier.interrupt();
+        //_task_handlers.clear();
     }
 
     //! Resize the number of transport channels
     void resize(const size_t size){
         if (this->size() == size) return;
-        _task_handlers.clear();
+        //_task_handlers.clear();
         _props.resize(size);
         //re-initialize all buffers infos by re-creating the vector
         _buffers_infos = std::vector<buffers_info_type>(4, buffers_info_type(size));
-        _task_barrier.resize(size);
-        _task_handlers.resize(size);
-        for (size_t i = 1/*skip 0*/; i < size; i++){
-            _task_handlers[i] = task::make(boost::bind(&recv_packet_handler::converter_thread_task, this, i));
-        };
+        //_task_barrier.resize(size);
+        //_task_handlers.resize(size);
+        //for (size_t i = 1/*skip 0*/; i < size; i++){
+        //    _task_handlers[i] = task::make(boost::bind(&recv_packet_handler::converter_thread_task, this, i));
+        //};
     }
 
     //! Get the channel width of this handler
@@ -539,7 +539,10 @@ private:
         _convert_bytes_to_copy = bytes_to_copy;
 
         //perform N channels of conversion
-        converter_thread_task(0);
+        for (size_t i = 0; i < _props.size(); i++)
+        {
+            converter_thread_task(i);
+        }
 
         //update the copy buffer's availability
         info.data_bytes_to_copy -= bytes_to_copy;
@@ -559,7 +562,7 @@ private:
      ******************************************************************/
     UHD_INLINE void converter_thread_task(const size_t index)
     {
-        _task_barrier.wait();
+        //_task_barrier.wait();
 
         //shortcut references to local data structures
         buffers_info_type &buff_info = get_curr_buffer_info();
@@ -585,12 +588,12 @@ private:
             info.buff.reset(); //effectively a release
         }
 
-        if (index == 0) _task_barrier.wait_others();
+        //if (index == 0) _task_barrier.wait_others();
     }
 
     //! Shared variables for the worker threads
-    reusable_barrier _task_barrier;
-    std::vector<task::sptr> _task_handlers;
+    //reusable_barrier _task_barrier;
+    //std::vector<task::sptr> _task_handlers;
     size_t _convert_nsamps;
     const rx_streamer::buffs_type *_convert_buffs;
     size_t _convert_buffer_offset_bytes;
