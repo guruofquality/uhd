@@ -1,5 +1,5 @@
 //
-// Copyright 2011-2013 Ettus Research LLC
+// Copyright 2011-2012 Ettus Research LLC
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -61,7 +61,8 @@ public:
     }
 
     ~send_packet_handler(void){
-        _task_barrier.interrupt();
+        _task_barrier_entry.interrupt();
+        _task_barrier_exit.interrupt();
         _task_handlers.clear();
     }
 
@@ -72,7 +73,8 @@ public:
         _props.resize(size);
         static const boost::uint64_t zero = 0;
         _zero_buffs.resize(size, &zero);
-        _task_barrier.resize(size);
+        _task_barrier_entry.resize(size);
+        _task_barrier_exit.resize(size);
         _task_handlers.resize(size);
         for (size_t i = 1/*skip 0*/; i < size; i++){
             _task_handlers[i] = task::make(boost::bind(&send_packet_handler::converter_thread_task, this, i));
@@ -270,7 +272,7 @@ private:
      ******************************************************************/
     UHD_INLINE void converter_thread_task(const size_t index)
     {
-        _task_barrier.wait();
+        _task_barrier_entry.wait();
 
         //shortcut references to local data structures
         managed_send_buffer::sptr &buff = _props[index].buff;
@@ -300,11 +302,11 @@ private:
         buff->commit(num_vita_words32*sizeof(boost::uint32_t));
         buff.reset(); //effectively a release
 
-        if (index == 0) _task_barrier.wait_others();
+        _task_barrier_exit.wait();
     }
 
     //! Shared variables for the worker threads
-    reusable_barrier _task_barrier;
+    reusable_barrier _task_barrier_entry, _task_barrier_exit;
     std::vector<task::sptr> _task_handlers;
     size_t _convert_nsamps;
     const tx_streamer::buffs_type *_convert_buffs;
