@@ -50,14 +50,34 @@ static const size_t DEFAULT_XFER_SIZE = 32*512; //bytes
 #endif
 
 /*!
+ * The libusb docs state that status and actual length can only be read in the callback.
+ * Therefore, this struct is intended to store data seen from the callback function.
+ */
+struct lut_result_t
+{
+    lut_result_t(void)
+    {
+        completed = 1;
+        status = LIBUSB_TRANSFER_COMPLETED;
+        actual_length = 0;
+    }
+    int completed;
+    libusb_transfer_status status;
+    int actual_length;
+};
+
+/*!
  * All libusb callback functions should be marked with the LIBUSB_CALL macro
  * to ensure that they are compiled with the same calling convention as libusb.
  */
 
 //! helper function: handles all async callbacks
-static void LIBUSB_CALL libusb_async_cb(libusb_transfer *lut){
-    int *completed = (int *)lut->user_data;
-    *completed = 1;
+static void LIBUSB_CALL libusb_async_cb(libusb_transfer *lut)
+{
+    lut_result_t *r = (lut_result_t *)lut->user_data;
+    r->completed = 1;
+    r->status = lut->status;
+    r->actual_length = lut->actual_length;
 }
 
 /*!
@@ -110,7 +130,7 @@ public:
         _lut(lut), _frame_size(frame_size) { /* NOP */ }
 
     void release(void){
-        completed = 0;
+        result.completed = 0;
         _lut->length = _frame_size; //always reset length
         const int ret = libusb_submit_transfer(_lut);
         if (ret != 0) throw uhd::runtime_error(
@@ -118,14 +138,17 @@ public:
     }
 
     sptr get_new(const double timeout, size_t &index){
-        if (wait_for_completion(_ctx, timeout, completed)){
+        if (wait_for_completion(_ctx, timeout, result.completed))
+        {
+            if (result.status != LIBUSB_TRANSFER_COMPLETED) throw uhd::runtime_error(
+                str(boost::format("usb rx transfer status: %d") % int(result.status)));
             index++;
-            return make(this, _lut->buffer, _lut->actual_length);
+            return make(this, _lut->buffer, result.actual_length);
         }
         return managed_recv_buffer::sptr();
     }
 
-    int completed;
+    lut_result_t result;
 
 private:
     libusb_context *_ctx;
@@ -142,10 +165,10 @@ class libusb_zero_copy_msb : public managed_send_buffer{
 public:
     libusb_zero_copy_msb(libusb_transfer *lut, const size_t frame_size):
         _ctx(libusb::session::get_global_session()->get_context()),
-        _lut(lut), _frame_size(frame_size) { completed = true; }
+        _lut(lut), _frame_size(frame_size) { /* NOP */ }
 
     void release(void){
-        completed = 0;
+        result.completed = 0;
         _lut->length = size();
         const int ret = libusb_submit_transfer(_lut);
         if (ret != 0) throw uhd::runtime_error(
@@ -153,14 +176,17 @@ public:
     }
 
     sptr get_new(const double timeout, size_t &index){
-        if (wait_for_completion(_ctx, timeout, completed)){
+        if (wait_for_completion(_ctx, timeout, result.completed))
+        {
+            if (result.status != LIBUSB_TRANSFER_COMPLETED) throw uhd::runtime_error(
+                str(boost::format("usb tx transfer status: %d") % int(result.status)));
             index++;
             return make(this, _lut->buffer, _frame_size);
         }
         return managed_send_buffer::sptr();
     }
 
-    int completed;
+    lut_result_t result;
 
 private:
     libusb_context *_ctx;
@@ -227,7 +253,7 @@ public:
                 static_cast<unsigned char *>(_recv_buffer_pool->at(i)), // buffer
                 this->get_recv_frame_size(),                            // length
                 libusb_transfer_cb_fn(&libusb_async_cb),                // callback
-                static_cast<void *>(&_mrb_pool.back()->completed),      // user_data
+                static_cast<void *>(&_mrb_pool.back()->result),         // user_data
                 0                                                       // timeout (ms)
             );
 
@@ -250,7 +276,7 @@ public:
                 static_cast<unsigned char *>(_send_buffer_pool->at(i)), // buffer
                 this->get_send_frame_size(),                            // length
                 libusb_transfer_cb_fn(&libusb_async_cb),                // callback
-                static_cast<void *>(&_msb_pool.back()->completed),      // user_data
+                static_cast<void *>(&_msb_pool.back()->result),         // user_data
                 0                                                       // timeout
             );
 
