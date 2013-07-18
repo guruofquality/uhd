@@ -18,14 +18,13 @@
 #include "libusb1_base.hpp"
 #include <uhd/transport/usb_zero_copy.hpp>
 #include <uhd/transport/buffer_pool.hpp>
+#include <uhd/transport/bounded_buffer.hpp>
 #include <uhd/utils/msg.hpp>
 #include <uhd/exception.hpp>
 #include <boost/foreach.hpp>
 #include <boost/format.hpp>
-#include <boost/bind.hpp>
-#include <boost/function.hpp>
 #include <boost/make_shared.hpp>
-#include <boost/thread/thread.hpp>
+#include <boost/thread/mutex.hpp>
 #include <list>
 
 using namespace uhd;
@@ -41,7 +40,7 @@ static const size_t DEFAULT_XFER_SIZE = 32*512; //bytes
 
 //! libusb_handle_events_timeout_completed is only in newer API
 #ifndef HAVE_LIBUSB_HANDLE_EVENTS_TIMEOUT_COMPLETED
-    #define libusb_handle_events_timeout_completed(ctx, tx, completed)\
+    #define libusb_handle_events_timeout_completed(ctx, tx, completed) \
         libusb_handle_events_timeout(ctx, tx)
 #endif
 
@@ -59,19 +58,14 @@ struct lut_result_t
 {
     lut_result_t(void)
     {
-        release_me = false;
         completed = 0;
         status = LIBUSB_TRANSFER_COMPLETED;
         actual_length = 0;
     }
-    bool release_me;
     int completed;
     libusb_transfer_status status;
     int actual_length;
 };
-
-//! Callback used in release implementation
-typedef boost::function<void(lut_result_t *)> lut_result_cb_t;
 
 /*!
  * All libusb callback functions should be marked with the LIBUSB_CALL macro
@@ -134,32 +128,27 @@ UHD_INLINE bool wait_for_completion(libusb_context *ctx, const double timeout, i
 class libusb_zero_copy_mrb : public managed_recv_buffer
 {
 public:
-    libusb_zero_copy_mrb(libusb_transfer *lut, const size_t frame_size, lut_result_cb_t release_cb):
-        _release_cb(release_cb),
+    libusb_zero_copy_mrb(libusb_transfer *lut, const size_t frame_size, boost::shared_ptr<bounded_buffer<libusb_zero_copy_mrb *> > release_queue):
+        _release_queue(release_queue),
         _ctx(libusb::session::get_global_session()->get_context()),
         _lut(lut), _frame_size(frame_size) { /* NOP */ }
 
-    void release(void){_release_cb(&result);}
-
-    UHD_INLINE bool submit(void)
+    void release(void)
     {
-        if (not result.release_me) return false;
-        result.release_me = false;
         _lut->length = _frame_size; //always reset length
         const int ret = libusb_submit_transfer(_lut);
         if (ret != 0) throw uhd::runtime_error(
             "usb rx submit failed: " + std::string(libusb_error_name(ret)));
-        return true;
+        _release_queue->push_with_haste(this);
     }
 
-    sptr get_new(const double timeout, size_t &index)
+    sptr get_new(const double timeout, libusb_zero_copy_mrb **p)
     {
         if (wait_for_completion(_ctx, timeout, result.completed))
         {
             if (result.status != LIBUSB_TRANSFER_COMPLETED) throw uhd::runtime_error(
                 str(boost::format("usb rx transfer status: %d") % int(result.status)));
-            index++;
-            result.completed = 0;
+            result.completed = 0; *p = NULL;
             return make(this, _lut->buffer, result.actual_length);
         }
         return managed_recv_buffer::sptr();
@@ -168,7 +157,7 @@ public:
     lut_result_t result;
 
 private:
-    lut_result_cb_t _release_cb;
+    boost::shared_ptr<bounded_buffer<libusb_zero_copy_mrb *> > _release_queue;
     libusb_context *_ctx;
     libusb_transfer *_lut;
     const size_t _frame_size;
@@ -182,32 +171,27 @@ private:
 class libusb_zero_copy_msb : public managed_send_buffer
 {
 public:
-    libusb_zero_copy_msb(libusb_transfer *lut, const size_t frame_size, lut_result_cb_t release_cb):
-        _release_cb(release_cb),
+    libusb_zero_copy_msb(libusb_transfer *lut, const size_t frame_size, boost::shared_ptr<bounded_buffer<libusb_zero_copy_msb *> > release_queue):
+        _release_queue(release_queue),
         _ctx(libusb::session::get_global_session()->get_context()),
         _lut(lut), _frame_size(frame_size) { /* NOP */ }
 
-    void release(void){_release_cb(&result);}
-
-    UHD_INLINE bool submit(void)
+    void release(void)
     {
-        if (not result.release_me) return false;
-        result.release_me = false;
         _lut->length = size();
         const int ret = libusb_submit_transfer(_lut);
         if (ret != 0) throw uhd::runtime_error(
             "usb tx submit failed: " + std::string(libusb_error_name(ret)));
-        return true;
+        _release_queue->push_with_haste(this);
     }
 
-    sptr get_new(const double timeout, size_t &index)
+    sptr get_new(const double timeout, libusb_zero_copy_msb **p)
     {
         if (wait_for_completion(_ctx, timeout, result.completed))
         {
             if (result.status != LIBUSB_TRANSFER_COMPLETED) throw uhd::runtime_error(
                 str(boost::format("usb tx transfer status: %d") % int(result.status)));
-            index++;
-            result.completed = 0;
+            result.completed = 0; *p = NULL;
             return make(this, _lut->buffer, _frame_size);
         }
         return managed_send_buffer::sptr();
@@ -216,7 +200,7 @@ public:
     lut_result_t result;
 
 private:
-    lut_result_cb_t _release_cb;
+    boost::shared_ptr<bounded_buffer<libusb_zero_copy_msb *> > _release_queue;
     libusb_context *_ctx;
     libusb_transfer *_lut;
     const size_t _frame_size;
@@ -244,8 +228,9 @@ public:
         _num_send_frames(size_t(hints.cast<double>("num_send_frames", DEFAULT_NUM_XFERS))),
         _recv_buffer_pool(buffer_pool::make(_num_recv_frames, _recv_frame_size)),
         _send_buffer_pool(buffer_pool::make(_num_send_frames, _send_frame_size)),
-        _next_recv_buff_index(0), _next_send_buff_index(0),
-        _last_recv_buff_index(0), _last_send_buff_index(0)
+        _mrb_released(new bounded_buffer<libusb_zero_copy_mrb *>(_num_recv_frames)),
+        _msb_released(new bounded_buffer<libusb_zero_copy_msb *>(_num_send_frames)),
+        _front_mrb(NULL), _front_msb(NULL)
     {
         _handle->claim_interface(recv_interface);
         _handle->claim_interface(send_interface);
@@ -274,8 +259,7 @@ public:
             UHD_ASSERT_THROW(lut != NULL);
 
             _mrb_pool.push_back(boost::make_shared<libusb_zero_copy_mrb>(
-                lut, this->get_recv_frame_size(),
-                boost::bind(&libusb_zero_copy_impl::recv_release, this, _1)
+                lut, this->get_recv_frame_size(), _mrb_released
             ));
 
             libusb_fill_bulk_transfer(
@@ -299,8 +283,7 @@ public:
             UHD_ASSERT_THROW(lut != NULL);
 
             _msb_pool.push_back(boost::make_shared<libusb_zero_copy_msb>(
-                lut, this->get_send_frame_size(),
-                boost::bind(&libusb_zero_copy_impl::send_release, this, _1)
+                lut, this->get_send_frame_size(), _msb_released
             ));
 
             libusb_fill_bulk_transfer(
@@ -326,7 +309,9 @@ public:
         //initial fake complete for all send buffers
         for (size_t i = 0; i < get_num_send_frames(); i++)
         {
-            _msb_pool[i]->result.completed = 1;
+            libusb_zero_copy_msb &msb = *(_msb_pool[i]);
+            msb.result.completed = 1;
+            _msb_released->push_with_haste(&msb);
         }
     }
 
@@ -351,38 +336,20 @@ public:
         }
     }
 
-    void recv_release(lut_result_t *result)
-    {
-        boost::mutex::scoped_lock l(_recv_mutex);
-        result->release_me = true; //only set in locked context
-        while (_mrb_pool[_last_recv_buff_index % _num_recv_frames]->submit())
-        {
-            _last_recv_buff_index++;
-        }
-    }
-
-    void send_release(lut_result_t *result)
-    {
-        boost::mutex::scoped_lock l(_send_mutex);
-        result->release_me = true; //only set in locked context
-        while (_msb_pool[_last_send_buff_index % _num_send_frames]->submit())
-        {
-            _last_send_buff_index++;
-        }
-    }
-
     managed_recv_buffer::sptr get_recv_buff(double timeout)
     {
         boost::mutex::scoped_lock l(_recv_mutex);
-        const size_t index = _next_recv_buff_index % _num_recv_frames;
-        return _mrb_pool[index]->get_new(timeout, _next_recv_buff_index);
+        if (_front_mrb == NULL) _mrb_released->pop_with_timed_wait(_front_mrb, timeout);
+        if (_front_mrb == NULL) return managed_recv_buffer::sptr();
+        return _front_mrb->get_new(timeout, &_front_mrb);
     }
 
     managed_send_buffer::sptr get_send_buff(double timeout)
     {
         boost::mutex::scoped_lock l(_send_mutex);
-        const size_t index = _next_send_buff_index % _num_send_frames;
-        return _msb_pool[index]->get_new(timeout, _next_send_buff_index);
+        if (_front_msb == NULL) _msb_released->pop_with_timed_wait(_front_msb, timeout);
+        if (_front_msb == NULL) return managed_send_buffer::sptr();
+        return _front_msb->get_new(timeout, &_front_msb);
     }
 
     size_t get_num_recv_frames(void) const { return _num_recv_frames; }
@@ -395,14 +362,20 @@ private:
     libusb::device_handle::sptr _handle;
     const size_t _recv_frame_size, _num_recv_frames;
     const size_t _send_frame_size, _num_send_frames;
+
     boost::mutex _recv_mutex, _send_mutex;
 
     //! Storage for transfer related objects
     buffer_pool::sptr _recv_buffer_pool, _send_buffer_pool;
     std::vector<boost::shared_ptr<libusb_zero_copy_mrb> > _mrb_pool;
     std::vector<boost::shared_ptr<libusb_zero_copy_msb> > _msb_pool;
-    size_t _next_recv_buff_index, _next_send_buff_index;
-    size_t _last_recv_buff_index, _last_send_buff_index;
+
+    //! Queues to track released buffers
+    boost::shared_ptr<bounded_buffer<libusb_zero_copy_mrb *> > _mrb_released;
+    boost::shared_ptr<bounded_buffer<libusb_zero_copy_msb *> > _msb_released;
+
+    libusb_zero_copy_mrb *_front_mrb;
+    libusb_zero_copy_msb *_front_msb;
 
     //! a list of all transfer structs we allocated
     std::list<libusb_transfer *> _all_luts;
