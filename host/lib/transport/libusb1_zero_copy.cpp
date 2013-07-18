@@ -304,11 +304,13 @@ public:
     }
 
     managed_recv_buffer::sptr get_recv_buff(double timeout){
+        boost::mutex::scoped_lock l(_recv_mutex);
         if (_next_recv_buff_index == _num_recv_frames) _next_recv_buff_index = 0;
         return _mrb_pool[_next_recv_buff_index]->get_new(timeout, _next_recv_buff_index);
     }
 
     managed_send_buffer::sptr get_send_buff(double timeout){
+        boost::mutex::scoped_lock l(_send_mutex);
         if (_next_send_buff_index == _num_send_frames) _next_send_buff_index = 0;
         return _msb_pool[_next_send_buff_index]->get_new(timeout, _next_send_buff_index);
     }
@@ -323,6 +325,7 @@ private:
     libusb::device_handle::sptr _handle;
     const size_t _recv_frame_size, _num_recv_frames;
     const size_t _send_frame_size, _num_send_frames;
+    boost::mutex _recv_mutex, _send_mutex;
 
     //! Storage for transfer related objects
     buffer_pool::sptr _recv_buffer_pool, _send_buffer_pool;
