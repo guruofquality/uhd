@@ -203,7 +203,7 @@ b100_impl::b100_impl(const device_addr_t &device_addr){
         if (initialization_count > 1) throw;
         UHD_MSG(warning) <<
             "The control endpoint was left in a bad state.\n"
-            "Attempting endpoint re-enumeration...\n" << ex << std::endl;
+            "Attempting endpoint re-enumeration...\n" << ex.what() << std::endl;
         _fifo_ctrl.reset();
         _ctrl_transport.reset();
         _fx2_ctrl->usrp_fx2_reset();
